@@ -1,175 +1,281 @@
 import os
-import argparse
-import random
 import numpy as np
-import torch
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader, RandomSampler
-from commons import NERdataset, logger, init_logger
-from processor import NERProcessor
-from transformers import PhobertTokenizer
-from tqdm import tqdm
-from model import *
-from fairseq.data.encoders.fastbpe import fastBPE
-from fairseq.data import Dictionary
-from transformers import AdamW, get_linear_schedule_with_warmup
-from sklearn.metrics import classification_report, f1_score
+import logging
+import sys
+import transformers
 
-def build_dataset(args, processor, data_type='train', feature=None, device=torch.device('cpu')):
-    # Load data features from cache or dataset file
-    cached_features_file = os.path.join(args.data_dir, 'cached_{}_{}_{}'.format(
-        data_type,
-        list(filter(None, args.model_name_or_path.split('/'))).pop(),
-        str(args.max_seq_length)))
+from torch import nn
+from dataclasses import dataclass, field
+from transformers.trainer_utils import is_main_process
+from transformers import (
+    set_seed,
+    AutoConfig, AutoTokenizer, 
+    EvalPrediction,Trainer, AutoModelForTokenClassification,
+    HfArgumentParser,
+    TrainingArguments,
+    DataCollatorWithPadding)
+from importlib import import_module
+from commons import Split, TokenClassificationDataset, TokenClassificationTask
+from typing import Dict, List, Optional, Tuple
+from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-    if os.path.exists(cached_features_file):
-        print("Loading features from cached file %s", cached_features_file)
-        features = torch.load(cached_features_file)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
+    """
+
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    task_type: Optional[str] = field(
+        default="NER", metadata={"help": "Task type to fine tune in training (e.g. NER, POS, etc)"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    use_fast: bool = field(default=False, metadata={"help": "Set this flag to use fast tokenization."})
+    # If you want to tweak more attributes on your tokenizer, you should do it in a distinct script,
+    # or just modify its tokenizer_config.json.
+    cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
+    )
+
+
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    """
+
+    data_dir: str = field(
+        metadata={"help": "The input data dir. Should contain the .txt files for a CoNLL-2003-formatted task."}
+    )
+    labels: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a file containing all labels. If not specified, CoNLL-2003 labels are used."},
+    )
+    max_seq_length: int = field(
+        default=128,
+        metadata={
+            "help": "The maximum total input sequence length after tokenization. Sequences longer "
+            "than this will be truncated, sequences shorter will be padded."
+        },
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+
+
+def run():
+
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # If we pass only one argument to the script and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        print("Creating features from dataset file at %s", args.data_dir)
-        examples, labels = processor.get_example(data_type, feature is not None)
-        
-        # features = processor.convert_examples_to_features(examples, labels, args.max_seq_length, feature)
-        # print("Saving features into cached file %s", cached_features_file)
-        # torch.save(features, cached_features_file)
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    return NERdataset(processor.tokenizer, processor.max_seq_length, examples, tags=labels)
+    if (
+        os.path.exists(training_args.output_dir)
+        and os.listdir(training_args.output_dir)
+        and training_args.do_train
+        and not training_args.overwrite_output_dir
+    ):
+        raise ValueError(
+            f"Output directory ({training_args.output_dir}) already exists and is not empty. Use --overwrite_output_dir to overcome."
+        )
 
-def train_function(iterator, model, optimizer, device, scheduler):
-    model.train()
-    tr_loss = 0
-    for data in tqdm(iterator, total=len(iterator)):
-        for k, v in data.items():
-            data[k] = v.to(device)
-        optimizer.zero_grad()
-        _, loss = model(**data)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        tr_loss += loss.item()
-    return tr_loss / len(iterator)
+    module = import_module("tasks")
 
+    try:
+        token_classification_task_clazz = getattr(module, model_args.task_type)
+        token_classification_task: TokenClassificationTask = token_classification_task_clazz()
+    except AttributeError:
+        raise ValueError(
+            f"Task {model_args.task_type} needs to be defined as a TokenClassificationTask subclass in {module}. "
+            f"Available tasks classes are: {TokenClassificationTask.__subclasses__()}"
+        )
 
-def evaluate(iterator, model, device):
-    model.eval()
-    eval_loss = 0
-    for data in tqdm(iterator, total=len(iterator)):
-        for k, v in data.items():
-            data[k] = v.to(device)
-        _, loss = model(**data)
-        eval_loss += loss.item()
-    return eval_loss / len(iterator)
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
+    )
+    logger.warning(
+        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+        training_args.local_rank,
+        training_args.device,
+        training_args.n_gpu,
+        bool(training_args.local_rank != -1),
+        training_args.fp16,
+    )
+    if is_main_process(training_args.local_rank):
+        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.enable_default_handler()
+        transformers.utils.logging.enable_explicit_format()
+    logger.info("Training/evaluation parameters %s", training_args)
 
-def run(args):
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    set_seed(training_args.seed)
 
-    summary_writer = SummaryWriter(args.log_dir)
-    init_logger(f"{args.output_dir}/vner_trainning.log")
-    
-    tokenizer = PhobertTokenizer.from_pretrained('vinai/phobert-base', use_fast=False)
-    processor = NERProcessor(args.data_dir, tokenizer)
+    labels = token_classification_task.get_labels(a.labels)
+    label_map: Dict[int, str] = {i: label for i, label in enumerate(labels)}
+    num_labels = len(labels)
 
-    num_labels = processor.get_num_labels()
-    config, model = model_builder(model_name_or_path=args.model_name_or_path,
-                                    num_labels=num_labels)
-    model.to(device)
+    #Load pretrained
+    config = AutoConfig.from_pretrained(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        num_labels=num_labels,
+        id2label=label_map,
+        label2id={label: i for i, label in enumerate(labels)},
+        cache_dir=model_args.cache_dir,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast,
+    )
+    model = AutoModelForTokenClassification.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+    )
 
-    logger.info("Prepare dataset ...")
+    # Get datasets
+    train_dataset = (
+        TokenClassificationDataset(
+            token_classification_task=token_classification_task,
+            data_dir=data_args.data_dir,
+            tokenizer=tokenizer,
+            labels=labels,
+            model_type=config.model_type,
+            max_seq_length=data_args.max_seq_length,
+            overwrite_cache=data_args.overwrite_cache,
+            mode=Split.train,
+        )
+        if training_args.do_train
+        else None
+    )
+    eval_dataset = (
+        TokenClassificationDataset(
+            token_classification_task=token_classification_task,
+            data_dir=data_args.data_dir,
+            tokenizer=tokenizer,
+            labels=labels,
+            model_type=config.model_type,
+            max_seq_length=data_args.max_seq_length,
+            overwrite_cache=data_args.overwrite_cache,
+            mode=Split.test,
+        )
+        if training_args.do_eval
+        else None
+    )
 
-    # train_data = build_dataset(args, processor, data_type='train', feature=None, device=device)
-    train_examples, train_labels = processor.get_example(data_type='train')
-    train_data = NERdataset(processor.tokenizer, args.max_seq_length, train_examples, train_labels)
-    # train_sampler = RandomSampler(train_data)
-    train_iterator = DataLoader(train_data, batch_size=args.train_batch_size)
+    def align_predictions(predictions: np.ndarray, label_ids: np.ndarray) -> Tuple[List[int], List[int]]:
+        preds = np.argmax(predictions, axis=2)
 
-    # eval_data = build_dataset(args, processor, data_type='test', feature=None, device=device)
-    eval_examples, eval_labels = processor.get_example(data_type='test')
-    eval_data = NERdataset(processor.tokenizer, args.max_seq_length, eval_examples, eval_labels)
-    # eval_sampler = RandomSampler(eval_data)
-    eval_iterator = DataLoader(eval_data, batch_size=args.eval_batch_size)
-    
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
-    num_train_optimization_steps = len(train_iterator) // args.gradient_accumulation_steps * args.num_train_epochs
-    warmup_steps = int(args.warmup_proportion * num_train_optimization_steps)
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps,
-                                                num_training_steps=num_train_optimization_steps)
+        batch_size, seq_len = preds.shape
 
-    logger.info("="*30 + f"Summary" + "="*30)
-    logger.info("MODEL:")
-    logger.info(f"\tBERT model: {args.model_name_or_path}")
-    logger.info(f"\tNumber of parameters: {sum(p.numel() for p in model.parameters())}")
-    logger.info("DATASET:")
-    logger.info(f"\tNumber of train Examples: {len(train_data)}")
-    logger.info(f"\tNumber of eval Examples: {len(eval_data)}")
-    logger.info(f"\tNumber of labels: {len(processor.labels)}")
-    logger.info("Hyper-Parameters:")
-    logger.info(f"\tMax sequence length: {args.max_seq_length}")
-    logger.info(f"\tLearning rate: {args.learning_rate}")
-    logger.info(f"\tNumber of epochs: {args.num_train_epochs}")
-    logger.info(f"\tTrain batch size: {args.train_batch_size}")
-    logger.info(f"\tEval batch size: {args.eval_batch_size}")
-    logger.info(f"\tAdam epsilon: {args.adam_epsilon}")
-    logger.info(f"\tWeight decay: {args.weight_decay}")
-    logger.info(f"\tWarmup Proportion: {args.warmup_proportion}")
-    logger.info(f"\tMax grad norm: {args.max_grad_norm}")
-    logger.info(f"\tGradient accumulation steps: {args.gradient_accumulation_steps}")
-    logger.info(f"\tSeed: {args.seed}")
-    logger.info(f"\tCuda: {args.cuda}")
-    logger.info(f"\tFeat config: {args.feat_config}")
-    logger.info(f"\tUse one-hot embbeding: {args.one_hot_emb}")
-    logger.info(f"\tOutput directory: {args.output_dir}")
-    logger.info(f"\tLog directory: {args.log_dir}")
+        out_label_list = [[] for _ in range(batch_size)]
+        preds_list = [[] for _ in range(batch_size)]
 
+        for i in range(batch_size):
+            for j in range(seq_len):
+                if label_ids[i, j] != nn.CrossEntropyLoss().ignore_index:
+                    out_label_list[i].append(label_map[label_ids[i][j]])
+                    preds_list[i].append(label_map[preds[i][j]])
 
-    model.train()
-    best_loss = -1
-    for e in range(int(args.num_train_epochs)):
-        logger.info("="*30 + f"Epoch {e}" + "="*30)
-        tr_loss = train_function(train_iterator, model, optimizer, device, scheduler)
-        eval_loss = evaluate(eval_iterator, model, device)
+        return preds_list, out_label_list
 
-        print(f"Epoch {e}: Train Loss = {tr_loss} Valid Loss = {eval_loss}")
-        if eval_loss < best_loss:
-            model_path = f"{args.output_dir}/vner_model.bin"
-            torch.save(model.state_dict(), model_path)
-            best_loss = eval_loss
+    def compute_metrics(p: EvalPrediction) -> Dict:
+        preds_list, out_label_list = align_predictions(p.predictions, p.label_ids)
+        return {
+            "accuracy_score": accuracy_score(out_label_list, preds_list),
+            "precision": precision_score(out_label_list, preds_list),
+            "recall": recall_score(out_label_list, preds_list),
+            "f1": f1_score(out_label_list, preds_list),
+        }
+
+    # Data collator
+    data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8) if training_args.fp16 else None
+
+    #train
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        compute_metrics=compute_metrics,
+        data_collator=data_collator,
+    )
+
+    if training_args.do_train:
+        trainer.train(
+            model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None
+        )
+        trainer.save_model()
+        # For convenience, we also re-save the tokenizer to the same directory,
+        # so that you can share your model easily on huggingface.co/models =)
+        if trainer.is_world_process_zero():
+            tokenizer.save_pretrained(training_args.output_dir)
+
+    #eval
+    results = {}
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+
+        result = trainer.evaluate()
+
+        output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
+        if trainer.is_world_process_zero():
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results *****")
+                for key, value in result.items():
+                    logger.info("  %s = %s", key, value)
+                    writer.write("%s = %s\n" % (key, value))
+
+            results.update(result)
+
+    # Predict
+    if training_args.do_predict:
+        test_dataset = TokenClassificationDataset(
+            token_classification_task=token_classification_task,
+            data_dir=data_args.data_dir,
+            tokenizer=tokenizer,
+            labels=labels,
+            model_type=config.model_type,
+            max_seq_length=data_args.max_seq_length,
+            overwrite_cache=data_args.overwrite_cache,
+            mode=Split.test,
+        )
+
+        predictions, label_ids, metrics = trainer.predict(test_dataset)
+        preds_list, _ = align_predictions(predictions, label_ids)
+
+        output_test_results_file = os.path.join(training_args.output_dir, "test_results.txt")
+        if trainer.is_world_process_zero():
+            with open(output_test_results_file, "w") as writer:
+                for key, value in metrics.items():
+                    logger.info("  %s = %s", key, value)
+                    writer.write("%s = %s\n" % (key, value))
+
+        # Save predictions
+        output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
+        if trainer.is_world_process_zero():
+            with open(output_test_predictions_file, "w") as writer:
+                with open(os.path.join(data_args.data_dir, "test.txt"), "r") as f:
+                    token_classification_task.write_predictions_to_file(writer, f, preds_list)
+
+    return results
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    # Required parameters
-    parser.add_argument("--data_dir", default=None, type=str, required=True)
-    parser.add_argument("--model_name_or_path", default=None, type=str, required=True)
-    parser.add_argument("--output_dir", default=None, type=str, required=True)
-    parser.add_argument("--log_dir", default=None, type=str, required=True)
-
-    # Other parameters
-    parser.add_argument("--feat_config", default=None, type=str)
-    parser.add_argument("--one_hot_emb", action='store_true')
-    parser.add_argument("--use_lstm", action='store_true')
-    parser.add_argument("--cache_dir", default="", type=str)
-    parser.add_argument("--max_seq_length", default=128, type=int)
-    parser.add_argument("--train_batch_size", default=8, type=int)
-    parser.add_argument("--eval_batch_size", default=4, type=int)
-    parser.add_argument("--learning_rate", default=2e-5, type=float)
-    parser.add_argument("--weight_decay", default=0.0, type=float)
-    parser.add_argument("--adam_epsilon", default=1e-8, type=float)
-    parser.add_argument("--num_train_epochs", default=100.0, type=float)
-    parser.add_argument("--warmup_proportion", default=0.1, type=float)
-    parser.add_argument("--gradient_accumulation_steps", default=1, type=int)
-    parser.add_argument("--max_grad_norm", default=1.0, type=float)
-    parser.add_argument("--cuda", action='store_true')
-    parser.add_argument('--seed', type=int, default=42)
-    args = parser.parse_args()
-    
-    run(args)
+    run()
