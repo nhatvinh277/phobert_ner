@@ -8,6 +8,13 @@ import torch.nn as nn
 
 logging.set_verbosity_error()
 
+def loss_fn(label, target, attention_mask, num_labels):
+    loss_function = nn.CrossEntropyLoss()
+    active_loss = attention_mask.view(-1) == 1
+    active_logits = label.view(-1, num_labels)
+    active_labels = torch.where(active_loss, target.view(-1), torch.tensor(loss_function.ignore_index).type_as(target))
+    loss = loss_function(active_logits, active_labels)
+    return loss, (active_logits, active_labels)
 
 class PhoBertLstmCrf(RobertaForTokenClassification):
     def __init__(self, config):
@@ -23,58 +30,17 @@ class PhoBertLstmCrf(RobertaForTokenClassification):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(self.hidden_size, config.num_labels)
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, valid_ids=None,
-                label_masks=None):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, target_label=None):
         seq_output = self.roberta(input_ids=input_ids,
                                   token_type_ids=token_type_ids,
                                   attention_mask=attention_mask,
                                   head_mask=None)[0]
         seq_output, _ = self.lstm(seq_output)
 
-        batch_size, max_len, feat_dim = seq_output.shape
-        valid_output = torch.zeros(batch_size, max_len, feat_dim, dtype=torch.float32, device=seq_output.device)
-        for i in range(batch_size):
-            jj = -1
-            for j in range(max_len):
-                if valid_ids[i][j].item() == 1:
-                    jj += 1
-                    valid_output[i][jj] = seq_output[i][j]
-
-        sequence_output = self.dropout(valid_output)
-        logits = self.classifier(sequence_output)
-        seq_tags = self.crf.decode(logits, mask=label_masks != 0)
-        if labels is not None:
-            log_likelihood = self.crf(logits, labels, mask=label_masks.type(torch.uint8))
-            return -1.0 * log_likelihood, seq_tags
-        else:
-            return seq_tags
-
-    def calculate_loss(self, input_ids, attention_masks, token_masks, segment_ids, label_ids, label_masks, feats):
-            seq_output = self.roberta(input_ids=input_ids,
-                                attention_mask=attention_masks,
-                                token_type_ids=segment_ids)[0]
-            seq_output, _ = self.lstm(seq_output)
-
-            batch_size, max_len, feat_dim = seq_output.shape
-            valid_output = torch.zeros(batch_size, max_len, feat_dim, dtype=torch.float32, device=seq_output.device)
-
-            for i in range(batch_size):
-                jj = -1
-                for j in range(max_len):
-                    if token_masks[i][j].item() == 1:
-                        jj += 1
-                        valid_output[i][jj] = seq_output[i][j]
-
-            sequence_output = self.dropout(valid_output)
-            logits = self.classifier(sequence_output)
-            loss_function = nn.CrossEntropyLoss()
-
-            mask = label_masks.view(-1) == 1
-            active_logits = logits.view(-1, self.num_labels)[mask]
-            active_labels = label_ids.view(-1)[mask]
-            loss = loss_function(active_logits, active_labels)
-
-            return loss, (active_logits, active_labels)
+        d_label = self.dropout(seq_output)
+        label = self.classifier(d_label)
+        loss, _ = loss_fn(label, target_label, attention_mask, self.num_labels)
+        return label, loss
 
 def model_builder(model_name_or_path: str,
                     num_labels:int):

@@ -7,6 +7,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, RandomSampler
 from commons import NERdataset, logger, init_logger
 from processor import NERProcessor
+from transformers import PhobertTokenizer
 from tqdm import tqdm
 from model import *
 from fairseq.data.encoders.fastbpe import fastBPE
@@ -26,65 +27,38 @@ def build_dataset(args, processor, data_type='train', feature=None, device=torch
         features = torch.load(cached_features_file)
     else:
         print("Creating features from dataset file at %s", args.data_dir)
-        examples = processor.get_example(data_type, feature is not None)
+        examples, labels = processor.get_example(data_type, feature is not None)
         
-        features = processor.convert_examples_to_features(examples, args.max_seq_length, feature)
-        print("Saving features into cached file %s", cached_features_file)
-        torch.save(features, cached_features_file)
+        # features = processor.convert_examples_to_features(examples, labels, args.max_seq_length, feature)
+        # print("Saving features into cached file %s", cached_features_file)
+        # torch.save(features, cached_features_file)
 
-    return NERdataset(features, device)
+    return NERdataset(processor.tokenizer, processor.max_seq_length, examples, tags=labels)
 
-def update_model_weights(model, iterator, optimizer, scheduler):
-    # init static variables
-    tr_loss = 0
+def train_function(iterator, model, optimizer, device, scheduler):
     model.train()
-
-    for step, batch in enumerate(tqdm(iterator, desc="Iteration")):
-        tokens, token_ids, attention_masks, token_mask, segment_ids, label_ids, label_masks, feats = batch
-        loss, _ = model.calculate_loss(token_ids, attention_masks, token_mask, segment_ids, label_ids, label_masks,
-                                       feats)
-        tr_loss += loss.item()
+    tr_loss = 0
+    for data in tqdm(iterator, total=len(iterator)):
+        for k, v in data.items():
+            data[k] = v.to(device)
+        optimizer.zero_grad()
+        _, loss = model(**data)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-        if (step + 1) % args.gradient_accumulation_steps == 0:
-            optimizer.step()
-            scheduler.step()
-            model.zero_grad()
-    return tr_loss
+        optimizer.step()
+        scheduler.step()
+        tr_loss += loss.item()
+    return tr_loss / len(iterator)
 
-def caculator_metric(preds, golds, labels):
-    pred_iob_labels = [labels[label_id - 1] for label_id in preds]
-    gold_iob_labels = [labels[label_id - 1] for label_id in golds]
 
-    pred_labels = [labels[label_id - 1].split("-")[-1].strip() for label_id in preds]
-    gold_labels = [labels[label_id - 1].split("-")[-1].strip() for label_id in golds]
-
-    iob_metric = classification_report(pred_iob_labels, gold_iob_labels, output_dict=True)
-    metric = classification_report(pred_labels, gold_labels, output_dict=True)
-
-    return iob_metric, metric
-
-def evaluate(model, iterator, label_map):
-    # init static variables
-    preds = []
-    golds = []
-    eval_loss = 0
+def evaluate(iterator, model, device):
     model.eval()
-
-    for step, batch in enumerate(tqdm(iterator, desc="Iteration")):
-        tokens, token_ids, attention_masks, token_mask, segment_ids, label_ids, label_masks, feats = batch
-        loss, (logits, labels) = model.calculate_loss(token_ids, attention_masks, token_mask, segment_ids, label_ids,
-                                                      label_masks, feats)
+    eval_loss = 0
+    for data in tqdm(iterator, total=len(iterator)):
+        for k, v in data.items():
+            data[k] = v.to(device)
+        _, loss = model(**data)
         eval_loss += loss.item()
-        logits = torch.argmax(nn.functional.softmax(logits, dim=-1), dim=-1)
-        pred = logits.detach().cpu().numpy()
-        gold = labels.to('cpu').numpy()
-        preds.extend(pred)
-        golds.extend(gold)
-
-    iob_metric, metric = caculator_metric(preds, golds, label_map)
-
-    return eval_loss, iob_metric, metric
+    return eval_loss / len(iterator)
 
 def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -94,19 +68,9 @@ def run(args):
 
     summary_writer = SummaryWriter(args.log_dir)
     init_logger(f"{args.output_dir}/vner_trainning.log")
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--bpe-codes', 
-        default="PhoBERT_base_transformers/bpe.codes",
-        required=False,
-        type=str,
-        help='path to fastBPE BPE'
-    )
-    bpe_args, unknown = parser.parse_known_args()
-    bpe = fastBPE(bpe_args)
-    vocab = Dictionary()
-    vocab.add_from_file("PhoBERT_base_transformers/dict.txt")
-    processor = NERProcessor(args.data_dir, bpe, vocab)
+    
+    tokenizer = PhobertTokenizer.from_pretrained('vinai/phobert-base', use_fast=False)
+    processor = NERProcessor(args.data_dir, tokenizer)
 
     num_labels = processor.get_num_labels()
     config, model = model_builder(model_name_or_path=args.model_name_or_path,
@@ -115,13 +79,17 @@ def run(args):
 
     logger.info("Prepare dataset ...")
 
-    train_data = build_dataset(args, processor, data_type='train', feature=None, device=device)
-    train_sampler = RandomSampler(train_data)
-    train_iterator = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
+    # train_data = build_dataset(args, processor, data_type='train', feature=None, device=device)
+    train_examples, train_labels = processor.get_example(data_type='train')
+    train_data = NERdataset(processor.tokenizer, args.max_seq_length, train_examples, train_labels)
+    # train_sampler = RandomSampler(train_data)
+    train_iterator = DataLoader(train_data, batch_size=args.train_batch_size)
 
-    eval_data = build_dataset(args, processor, data_type='test', feature=None, device=device)
-    eval_sampler = RandomSampler(eval_data)
-    eval_iterator = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+    # eval_data = build_dataset(args, processor, data_type='test', feature=None, device=device)
+    eval_examples, eval_labels = processor.get_example(data_type='test')
+    eval_data = NERdataset(processor.tokenizer, args.max_seq_length, eval_examples, eval_labels)
+    # eval_sampler = RandomSampler(eval_data)
+    eval_iterator = DataLoader(eval_data, batch_size=args.eval_batch_size)
     
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.weight']
@@ -164,52 +132,17 @@ def run(args):
 
 
     model.train()
-    best_score = -1
+    best_loss = -1
     for e in range(int(args.num_train_epochs)):
         logger.info("="*30 + f"Epoch {e}" + "="*30)
-        tr_loss = update_model_weights(model, train_iterator, optimizer, scheduler)
-        logger.info(f"train Loss: {tr_loss}")
-        eval_loss, iob_metric, metric = evaluate(model, eval_iterator, processor.labels)
-        logger.info(f"eval Loss: {eval_loss}")
-        logger.info(f"F1-Score tag: {metric['macro avg']['f1-score']}")
-        logger.info(f"F1-Score IOB-tag: {iob_metric['macro avg']['f1-score']}")
-        logger.info(f"Metric:")
-        logger.info(f"\tO: {metric['O']['f1-score'] if 'O' in metric else 0.0}")
-        logger.info(f"\tMISC: {metric['MISC']['f1-score'] if 'MISC' in metric else 0.0}")
-        logger.info(f"\tPER: {metric['PER']['f1-score'] if 'PER' in metric else 0.0}")
-        logger.info(f"\tORG: {metric['ORG']['f1-score'] if 'ORG' in metric else 0.0}")
-        logger.info(f"\tLOC: {metric['LOC']['f1-score'] if 'LOC' in metric else 0.0}")
-        summary_writer.add_scalar('LOSS/TRAIN', tr_loss, e)
-        summary_writer.add_scalar('LOSS/EVAL', eval_loss, e)
-        summary_writer.add_scalars('F1-SCORE/TAG', {
-            "AVG": metric['macro avg']['f1-score'],
-            "O": metric['O']['f1-score'] if 'O' in metric else 0.0,
-            "MISC": metric['MISC']['f1-score'] if 'MISC' in metric else 0.0,
-            "PER": metric['PER']['f1-score'] if 'PER' in metric else 0.0,
-            "ORG": metric['ORG']['f1-score'] if 'ORG' in metric else 0.0,
-            "LOC": metric['LOC']['f1-score'] if 'LOC' in metric else 0.0
-        }, e)
-        summary_writer.add_scalars('F1-SCORE/IOB TAG', {
-            "AVG": iob_metric['macro avg']['f1-score'],
-            "O": iob_metric['O']['f1-score'] if 'O' in iob_metric else 0.0,
-            "B-MISC": iob_metric['B-MISC']['f1-score'] if 'B-MISC' in iob_metric else 0.0,
-            "I-MISC": iob_metric['I-MISC']['f1-score'] if 'I-MISC' in iob_metric else 0.0,
-            "B-PER": iob_metric['B-PER']['f1-score'] if 'B-PER' in iob_metric else 0.0,
-            "I-PER": iob_metric['I-PER']['f1-score'] if 'I-PER' in iob_metric else 0.0,
-            "B-ORG": iob_metric['B-ORG']['f1-score'] if 'B-ORG' in iob_metric else 0.0,
-            "I-ORG": iob_metric['I-ORG']['f1-score'] if 'I-ORG' in iob_metric else 0.0,
-            "B-LOC": iob_metric['B-LOC']['f1-score'] if 'B-LOC' in iob_metric else 0.0,
-            "I-LOC": iob_metric['I-LOC']['f1-score'] if 'I-LOC' in iob_metric else 0.0
-        }, e)
+        tr_loss = train_function(train_iterator, model, optimizer, device, scheduler)
+        eval_loss = evaluate(eval_iterator, model, device)
 
-        if iob_metric['macro avg']['f1-score'] > best_score:
-            best_score = iob_metric['macro avg']['f1-score']
-            best_epoch = e
+        print(f"Epoch {e}: Train Loss = {tr_loss} Valid Loss = {eval_loss}")
+        if eval_loss < best_loss:
             model_path = f"{args.output_dir}/vner_model.bin"
             torch.save(model.state_dict(), model_path)
-            logger.info(f"Model save at epoch {best_epoch} with best score {best_score}")
-            summary_writer.add_text("Best result", f"F1-Score: {best_score}", best_epoch)
-            summary_writer.flush()
+            best_loss = eval_loss
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
